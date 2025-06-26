@@ -24,7 +24,7 @@
 
 #[cfg(feature = "postgres")]
 use core::error::Error;
-use core::{fmt, ops};
+use core::{fmt, ops, str::FromStr};
 
 #[cfg(feature = "postgres")]
 use bytes::BytesMut;
@@ -39,6 +39,11 @@ use serde::{Deserialize, Serialize, de};
 #[derive(Debug, derive_more::Display, derive_more::Error)]
 #[display("Could not convert to a Real: {_0}")]
 pub struct ConversionError(dashu_base::ConversionError);
+
+/// Error that occurs when a string cannot be parsed into a [`Real`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, derive_more::Display, derive_more::Error)]
+#[display("Could not parse a Real: {_0}")]
+pub struct ParseError(dashu_base::ParseError);
 
 /// A high-precision real number type.
 ///
@@ -63,10 +68,25 @@ pub struct ConversionError(dashu_base::ConversionError);
 /// let maybe_int = value.to_i32(); // Some(42)
 /// let float_val = value.to_f64(); // 42.0
 /// ```
+///
+/// # Implementation Notes
+///
+/// - **Decimal radix** – The significand is stored in base-10, so values such as `0.1` and `0.01`
+///   round-trip without error (`Real::from_str("0.1")?.to_string() == "0.1"`).
+/// - **Software fallback** – CPUs only accelerate binary FP; decimal math runs in software and is
+///   typically **3–10x** slower and larger than `f64`.
+/// - **Deterministic text I/O** – Converting to and from strings is loss-free, which ensures that
+///   serialized data, logs, and config files preserve every digit.
+/// - **When to pick `Real`** – Prefer it for financial or audit-grade workflows where correctness
+///   outweighs raw throughput. For hot paths that tolerate a few ULPs, stick to `f32`/`f64`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "codegen", derive(specta::Type))]
 pub struct Real(#[cfg_attr(feature = "codegen", specta(type = f64))] dashu_float::DBig);
 
+// Minimum precision for internal representation (64 bits). This balances accuracy and performance,
+// providing higher precision than f64 (53 bits) while maintaining reasonable computational costs.
+// This gives us ~19 decimal digits of precision vs ~15 for f64, reducing rounding errors in
+// financial calculations and iterative computations.
 const MIN_PRECISION: usize = 64;
 
 impl Real {
@@ -107,6 +127,15 @@ impl Real {
     #[must_use]
     pub fn to_f64(&self) -> f64 {
         self.0.to_f64().value()
+    }
+}
+
+impl FromStr for Real {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let decimal = dashu_float::DBig::from_str(value).map_err(ParseError)?;
+        Ok(Self(decimal))
     }
 }
 
@@ -280,7 +309,7 @@ impl PartialEq<Real> for &Real {
 
 impl fmt::Display for Real {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0.to_f64().value(), fmt)
+        fmt::Display::fmt(&self.0, fmt)
     }
 }
 
@@ -321,14 +350,22 @@ macro_rules! impl_real_from_primitive_float {
             type Error = ConversionError;
 
             fn try_from(primitive: $primitive) -> Result<Self, Self::Error> {
-                Ok(Self(
-                    dashu_float::FBig::<mode::Zero>::try_from(primitive)
-                        .map_err(ConversionError)?
-                        .with_precision(MIN_PRECISION)
-                        .value()
-                        .to_decimal()
-                        .value(),
-                ))
+                // The order of operations is important here! If we raise the precision first, it
+                // will lead to rounding errors for values that cannot be represented exactly in
+                // base 2 (such as 0.11).
+                // We need to first explicitly change the precision to the native type manually so
+                // that it can be converted to decimal, otherwise conversion with 0 precision (`0`)
+                // to decimal would panic.
+                let value = dashu_float::FBig::<mode::HalfAway>::try_from(primitive)
+                    .map_err(ConversionError)?
+                    .with_precision(<$primitive>::MANTISSA_DIGITS as usize)
+                    .value()
+                    .to_decimal()
+                    .value()
+                    .with_precision(MIN_PRECISION)
+                    .value();
+
+                Ok(Self(value))
             }
         }
 
